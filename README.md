@@ -1,83 +1,108 @@
-inal Project-AI — YOLOv8 Real-Time Object Detection
+✋ AI Finger Counting System (Final Project)
 
-📍 Final-Project-AI เป็นโปรเจกต์ระบบตรวจจับวัตถุแบบเรียลไทม์ (Real-Time Object Detection) ทำงานบนเว็บเบราว์เซอร์โดยใช้เว็บแคมและแสดงผล Bounding Box พร้อมชื่อคลาสและคะแนนความมั่นใจที่ตรวจจับได้
+Real-Time Finger Counting System using AI on Web Browser
+ระบบตรวจจับและนับจำนวนนิ้วมือทั้งสองข้างแบบเรียลไทม์ผ่านกล้องเว็บ
 
-🎯 Objective (วัตถุประสงค์)
+📌 Overview
 
-ศึกษาการนำ Deep Learning มาใช้งานในด้าน Computer Vision โดย:
+โปรเจกต์นี้เป็นระบบที่ใช้ AI สำหรับตรวจจับตำแหน่งมือและนับจำนวนนิ้วที่ยกอยู่แบบ Real-Time ผ่าน Web Browser โดยไม่ต้องติดตั้งโปรแกรมเพิ่มเติม
 
-ทำระบบตรวจจับวัตถุแบบเรียลไทม์
+ระบบสามารถ:
 
-ใช้โมเดล YOLOv8
+ตรวจจับมือได้สูงสุด 2 ข้าง
 
-แสดงผลผ่านเว็บด้วย ONNX Runtime ทำงานบนเบราว์เซอร์
+นับนิ้วได้ตั้งแต่ 0–10
 
-🧠 AI Model
-Element	Details
-Model	YOLOv8n
-Dataset	COCO (80 class)
-Format	ONNX (ผ่าน onnxruntime-web)
-Runtime	Browser WebAssembly
-⚙️ System Workflow
+แสดงผลแบบเรียลไทม์บนหน้าเว็บ
 
-เปิดกล้องเว็บแคม
+ใช้งานผ่านกล้อง Webcam
 
-Capture ภาพแบบ Real-Time
+🧠 Technologies Used
 
-Resize ภาพเป็นขนาด 640×640
+MediaPipe – ตรวจจับตำแหน่งจุด landmark ของมือ
 
-ส่งภาพเข้าโมเดล YOLOv8 ในรูป ONNX
+Next.js – Frontend framework
 
-ทำ Non-Maximum Suppression (NMS)
-
-แสดง Bounding Box + Class + Confidence |
-
-🛠️ Technologies Used
-
-Next.js (React)
+React – UI rendering
 
 TypeScript
 
 Tailwind CSS
 
-ONNX Runtime Web
+Web Camera API
 
-YOLOv8 |
+⚙️ How It Works
 
-📦 Installation / Run
+เปิดกล้องผ่าน Web Browser
 
-รันระบบเพื่อทดลองแบบพัฒนาในเครื่อง:
+ตรวจจับมือด้วย MediaPipe
 
+ได้ตำแหน่ง landmark 21 จุดต่อ 1 มือ
+
+วิเคราะห์ตำแหน่งปลายนิ้ว (Finger Tip)
+
+เปรียบเทียบกับข้อนิ้วเพื่อดูว่ายกอยู่หรือไม่
+
+รวมผลทั้งสองมือ
+
+แสดงผลจำนวนรวมบนหน้าจอ
+
+📷 Features
+
+✅ Real-Time Finger Counting
+✅ รองรับสองมือ
+✅ แสดงผล Bounding Points
+✅ ทำงานบน Web Browser
+✅ ไม่ต้องติดตั้งโปรแกรมเพิ่ม
+
+🚀 Installation & Setup
+# Clone repository
+git clone https://github.com/badtime1407/Final-Project-AI.git
+
+# เข้าโฟลเดอร์โปรเจกต์
+cd Final-Project-AI
+
+# ติดตั้ง dependencies
 npm install
+
+# รันโปรเจกต์
 npm run dev
 
-แล้วเปิดที่:
-👉 http://localhost:3000 (ในเว็บเบราว์เซอร์) |
+จากนั้นเปิดที่:
 
-▶️ Usage
+http://localhost:3000
 
-คลิกปุ่ม Start Camera เพื่อเริ่มตรวจจับวัตถุแบบ real-time
+อนุญาตการใช้กล้อง แล้วเริ่มใช้งานได้เลย 🎉
 
-คลิก Stop Camera เพื่อหยุดระบบ |
+📊 Output Example
 
-🚀 Features
+ระบบจะแสดงผล:
 
-✔️ ตรวจจับวัตถุแบบ real-time
-✔️ แสดง Bounding Boxes พร้อม Class Names และ Confidence Scores
-✔️ มีปุ่มควบคุม Start / Stop กล้อง |
+จุด landmark บนมือ
+
+จำนวนรวมของนิ้วที่ยกอยู่
+
+แสดงผลแบบ Real-Time
 
 ⚠️ Limitations
 
-❗ โมเดลเป็น Pre-trained (ไม่ได้เทรนเอง)
-❗ ความแม่นยำขึ้นกับสภาพแสงและมุมกล้อง
-❗ ใช้โมเดลขนาดเล็ก (เน้นความเร็วมากกว่าความแม่นยำ) |
+ความแม่นยำขึ้นกับแสงและความชัดของกล้อง
+
+มือที่ซ้อนกันอาจทำให้ค่าคลาดเคลื่อน
+
+มุมกล้องบางมุมอาจนับผิด
 
 🔮 Future Improvements
 
-ใช้โมเดล YOLOv8s หรือ YOLOv8m เพื่อเพิ่มความแม่นยำ
+เพิ่ม Gesture Recognition (เช่น 👍 ✌️ ✋)
 
-ฝึกกับ Dataset ของเราเอง
+เชื่อมต่อกับเกมหรือระบบควบคุมด้วยมือ
 
-กรอง Class ที่ต้องการตรวจจับเท่านั้น
+เพิ่มระบบควบคุมผ่านท่าทาง (Hand Control Interface)
 
-เพิ่ม Dashboard วิเคราะห์สถิติ |
+เพิ่มการบันทึกสถิติการใช้งาน
+
+🎓 Project Information
+
+Final Project – Artificial Intelligence
+Developed for educational purposes
