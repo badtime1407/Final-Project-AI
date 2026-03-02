@@ -1,5 +1,5 @@
 {
-  "name": "yolov8-object-detection",
+  "name": "finger_counter",
   "version": "0.1.0",
   "private": true,
   "scripts": {
