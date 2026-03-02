@@ -1,327 +1,368 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
+import * as ort from "onnxruntime-web";
 
-declare global {
-  interface Window { Hands: any; }
+const COCO_CLASSES = [
+  "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
+  "traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat","dog","horse","sheep","cow",
+  "elephant","bear","zebra","giraffe","backpack","umbrella","handbag","tie","suitcase","frisbee",
+  "skis","snowboard","sports ball","kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket",
+  "bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple","sandwich",
+  "orange","broccoli","carrot","hot dog","pizza","donut","cake","chair","couch","potted plant",
+  "bed","dining table","toilet","tv","laptop","mouse","remote","keyboard","cell phone",
+  "microwave","oven","toaster","sink","refrigerator","book","clock","vase","scissors","teddy bear","hair drier","toothbrush"
+];
+
+// Color palette per class (cycles through)
+const COLORS = [
+  "#00FF88","#FF4466","#44AAFF","#FFCC00","#FF88AA","#88FFCC",
+  "#FF8800","#AA44FF","#00CCFF","#FF0055",
+];
+
+function getColor(classId: number) {
+  return COLORS[classId % COLORS.length];
 }
 
-const FINGER_NAMES = ["หัวแม่มือ", "ชี้", "กลาง", "นาง", "ก้อย"];
-const FINGER_COLORS = ["#FF6B6B", "#FFD93D", "#6BCB77", "#4D96FF", "#FF922B"];
-const HAND_COLORS = { right: "#00FF88", left: "#FF6BFF" };
-
-export default function FingerCountPage() {
+export default function Home() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const handsRef = useRef<any>(null);
+  const offscreenRef = useRef<HTMLCanvasElement | null>(null); // reused offscreen canvas
+  const sessionRef = useRef<ort.InferenceSession | null>(null);
+  const isRunningRef = useRef(false);
   const animationRef = useRef<number | null>(null);
-  const handsDataRef = useRef<{ lm: any[]; isRight: boolean }[]>([]);
-  const lastProcessTimeRef = useRef(0);
-  const isProcessingRef = useRef(false);
+  const lastFrameTimeRef = useRef<number>(performance.now());
 
-  const PROCESS_INTERVAL = 100;
+  const [status, setStatus] = useState<"loading" | "ready" | "running" | "stopped">("loading");
+  const [fps, setFps] = useState(0);
+  const [detections, setDetections] = useState<{ label: string; score: number }[]>([]);
+  const [confidenceThreshold, setConfidenceThreshold] = useState(0.5);
+  const [maxDetections, setMaxDetections] = useState(10);
+  const confidenceRef = useRef(confidenceThreshold);
+  const maxDetRef = useRef(maxDetections);
 
-  const [status, setStatus] = useState<"idle" | "loading" | "running" | "stopped">("idle");
-  const [scriptLoaded, setScriptLoaded] = useState(false);
-  const [totalCount, setTotalCount] = useState(0);
-  const [handsInfo, setHandsInfo] = useState<{ isRight: boolean; up: boolean[]; count: number }[]>([]);
+  // Keep refs in sync with state for use inside rAF loop
+  useEffect(() => { confidenceRef.current = confidenceThreshold; }, [confidenceThreshold]);
+  useEffect(() => { maxDetRef.current = maxDetections; }, [maxDetections]);
 
-  // ── โหลด MediaPipe CDN ─────────────────────────────────────────
-  useEffect(() => {
-    if (document.getElementById("mp-hands")) { setScriptLoaded(true); return; }
-    const s = document.createElement("script");
-    s.id = "mp-hands";
-    s.src = "https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js";
-    s.crossOrigin = "anonymous";
-    s.onload = () => setScriptLoaded(true);
-    document.head.appendChild(s);
-    return () => stopCamera();
-  }, []);
-
-  // ── นับนิ้ว ────────────────────────────────────────────────────
-  function countFingers(lm: any[], isRight: boolean): boolean[] {
-    const up: boolean[] = [false, false, false, false, false];
-
-    // หัวแม่มือ: แกน X
-    up[0] = isRight
-      ? lm[4].x < lm[3].x && lm[4].x < lm[2].x
-      : lm[4].x > lm[3].x && lm[4].x > lm[2].x;
-
-    // นิ้วชี้–ก้อย: tip สูงกว่า mcp
-    const tips = [8, 12, 16, 20];
-    const mcps = [5,  9, 13, 17];
-    tips.forEach((tip, i) => {
-      up[i + 1] = lm[tip].y < lm[mcps[i]].y;
-    });
-
-    return up;
+  // ─── Load model ───────────────────────────────────────────────
+  async function loadModel() {
+    try {
+      sessionRef.current = await ort.InferenceSession.create(
+        "/models/yolov8n.onnx",
+        { executionProviders: ["wasm"] }
+      );
+      setStatus("ready");
+    } catch (e) {
+      console.error("Model load failed:", e);
+      setStatus("stopped");
+    }
   }
 
-  // ── วาด skeleton ───────────────────────────────────────────────
-  function drawSkeleton(
-    ctx: CanvasRenderingContext2D,
-    lm: any[],
-    w: number,
-    h: number,
-    up: boolean[],
-    isRight: boolean
-  ) {
-    const CONNECTIONS = [
-      [0,1],[1,2],[2,3],[3,4],
-      [0,5],[5,6],[6,7],[7,8],
-      [0,9],[9,10],[10,11],[11,12],
-      [0,13],[13,14],[14,15],[15,16],
-      [0,17],[17,18],[18,19],[19,20],
-      [5,9],[9,13],[13,17],
-    ];
+  // ─── Camera ───────────────────────────────────────────────────
+  async function startCamera() {
+    if (isRunningRef.current) return;
 
-    const baseColor = isRight ? HAND_COLORS.right : HAND_COLORS.left;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+      });
+      if (!videoRef.current) return;
 
-    // เส้นเชื่อม
-    ctx.strokeStyle = "rgba(255,255,255,0.25)";
-    ctx.lineWidth = 2;
-    CONNECTIONS.forEach(([a, b]) => {
-      ctx.beginPath();
-      ctx.moveTo(lm[a].x * w, lm[a].y * h);
-      ctx.lineTo(lm[b].x * w, lm[b].y * h);
-      ctx.stroke();
-    });
+      videoRef.current.srcObject = stream;
+      await videoRef.current.play();
+      isRunningRef.current = true;
+      setStatus("running");
+      animationRef.current = requestAnimationFrame(loop);
+    } catch (e) {
+      console.error("Camera error:", e);
+    }
+  }
 
-    // จุด landmark
-    const fingerGroups = [
-      [1,2,3,4],
-      [5,6,7,8],
-      [9,10,11,12],
-      [13,14,15,16],
-      [17,18,19,20],
-    ];
+  function stopCamera() {
+    isRunningRef.current = false;
+    if (animationRef.current) cancelAnimationFrame(animationRef.current);
 
-    lm.forEach((pt, idx) => {
-      let color = "rgba(255,255,255,0.4)";
-      if (idx === 0) {
-        color = baseColor;
-      } else {
-        fingerGroups.forEach((grp, fi) => {
-          if (grp.includes(idx)) {
-            color = up[fi] ? FINGER_COLORS[fi] : "rgba(255,255,255,0.3)";
-          }
-        });
+    const video = videoRef.current;
+    if (video?.srcObject) {
+      (video.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+      video.srcObject = null;
+    }
+
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext("2d");
+      ctx?.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    setDetections([]);
+    setFps(0);
+    setStatus("ready");
+  }
+
+  // ─── Preprocess (reuses offscreen canvas) ─────────────────────
+  function preprocess(sourceCanvas: HTMLCanvasElement): ort.Tensor {
+    const size = 640;
+    if (!offscreenRef.current) {
+      offscreenRef.current = document.createElement("canvas");
+      offscreenRef.current.width = size;
+      offscreenRef.current.height = size;
+    }
+    const tmp = offscreenRef.current;
+    const ctx = tmp.getContext("2d")!;
+    ctx.drawImage(sourceCanvas, 0, 0, size, size);
+
+    const img = ctx.getImageData(0, 0, size, size).data;
+    const input = new Float32Array(3 * size * size);
+
+    for (let c = 0; c < 3; c++) {
+      for (let i = 0; i < size * size; i++) {
+        input[c * size * size + i] = img[i * 4 + c] / 255.0;
       }
+    }
 
-      ctx.beginPath();
-      ctx.arc(pt.x * w, pt.y * h, idx === 0 ? 7 : 5, 0, Math.PI * 2);
-      ctx.fillStyle = color;
-      ctx.fill();
-      ctx.strokeStyle = "#000";
-      ctx.lineWidth = 1;
-      ctx.stroke();
-    });
-
-    // วาดเลขบนฝ่ามือ
-    const palmX = lm[9].x * w;
-    const palmY = lm[9].y * h;
-    const count = up.filter(Boolean).length;
-    ctx.font = "bold 52px 'Courier New'";
-    ctx.fillStyle = "rgba(0,0,0,0.6)";
-    ctx.fillText(String(count), palmX - 13, palmY + 3);
-    ctx.fillStyle = baseColor;
-    ctx.fillText(String(count), palmX - 15, palmY);
-
-    // label มือซ้าย/ขวา
-    const wristX = lm[0].x * w;
-    const wristY = lm[0].y * h;
-    ctx.font = "bold 13px 'Courier New'";
-    ctx.fillStyle = baseColor;
-    ctx.fillText(isRight ? "RIGHT" : "LEFT", wristX - 20, wristY + 20);
+    return new ort.Tensor("float32", input, [1, 3, size, size]);
   }
 
-  // ── Animation loop ─────────────────────────────────────────────
-  function animationLoop() {
-    animationRef.current = requestAnimationFrame(animationLoop);
+  // ─── IoU + NMS ────────────────────────────────────────────────
+  function iou(a: number[], b: number[]) {
+    const interW = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0]));
+    const interH = Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
+    const inter = interW * interH;
+    const union = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter;
+    return inter / union;
+  }
+
+  function nms(boxes: { box: number[]; score: number; classId: number }[], iouThreshold = 0.45) {
+    boxes.sort((a, b) => b.score - a.score);
+    const kept: typeof boxes = [];
+    while (boxes.length) {
+      const top = boxes.shift()!;
+      kept.push(top);
+      boxes = boxes.filter((b) => iou(top.box, b.box) < iouThreshold);
+    }
+    return kept;
+  }
+
+  // ─── Main inference loop ──────────────────────────────────────
+  const loop = useCallback(async () => {
+    if (!isRunningRef.current) return;
 
     const video = videoRef.current;
     const canvas = canvasRef.current;
-    if (!video || !canvas || video.readyState < 2) return;
+    const session = sessionRef.current;
 
-    if (canvas.width !== video.videoWidth && video.videoWidth > 0) {
+    if (!video || !canvas || !session || video.readyState < 2) {
+      animationRef.current = requestAnimationFrame(loop);
+      return;
+    }
+
+    // Sync canvas size to video (only changes when video dimensions change)
+    if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
     }
 
     const ctx = canvas.getContext("2d")!;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    ctx.drawImage(video, 0, 0);
 
-    handsDataRef.current.forEach(({ lm, isRight }) => {
-      const up = countFingers(lm, isRight);
-      drawSkeleton(ctx, lm, canvas.width, canvas.height, up, isRight);
+    const inputTensor = preprocess(canvas);
+    const feeds: Record<string, ort.Tensor> = {};
+    feeds[session.inputNames[0]] = inputTensor;
+
+    const output = await session.run(feeds);
+    const outTensor = output[session.outputNames[0]];
+    const out = outTensor.data as Float32Array;
+    const [, channels, numPred] = outTensor.dims;
+
+    const scaleX = canvas.width / 640;
+    const scaleY = canvas.height / 640;
+    const threshold = confidenceRef.current;
+    const rawBoxes: { box: number[]; score: number; classId: number }[] = [];
+
+    for (let i = 0; i < numPred; i++) {
+      const cx = out[0 * numPred + i];
+      const cy = out[1 * numPred + i];
+      const w  = out[2 * numPred + i];
+      const h  = out[3 * numPred + i];
+
+      let maxScore = 0;
+      let classId = 0;
+      for (let c = 4; c < channels; c++) {
+        const s = out[c * numPred + i];
+        if (s > maxScore) { maxScore = s; classId = c - 4; }
+      }
+
+      if (maxScore > threshold) {
+        rawBoxes.push({
+          box: [(cx - w/2) * scaleX, (cy - h/2) * scaleY, (cx + w/2) * scaleX, (cy + h/2) * scaleY],
+          score: maxScore,
+          classId,
+        });
+      }
+    }
+
+    const finalBoxes = nms(rawBoxes).slice(0, maxDetRef.current);
+
+    // ── Draw ──
+    finalBoxes.forEach((b) => {
+      const [x1, y1, x2, y2] = b.box;
+      const color = getColor(b.classId);
+      const label = COCO_CLASSES[b.classId] ?? "unknown";
+      const text = `${label} ${(b.score * 100).toFixed(1)}%`;
+
+      // Box
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2.5;
+      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+      // Corner accents
+      const clen = 12;
+      ctx.lineWidth = 4;
+      [
+        [x1, y1, x1+clen, y1, x1, y1+clen],
+        [x2, y1, x2-clen, y1, x2, y1+clen],
+        [x1, y2, x1+clen, y2, x1, y2-clen],
+        [x2, y2, x2-clen, y2, x2, y2-clen],
+      ].forEach(([mx, my, lx1, ly1, lx2, ly2]) => {
+        ctx.beginPath();
+        ctx.moveTo(mx, my);
+        ctx.lineTo(lx1, ly1);
+        ctx.moveTo(mx, my);
+        ctx.lineTo(lx2, ly2);
+        ctx.strokeStyle = color;
+        ctx.stroke();
+      });
+
+      // Label background
+      ctx.font = "bold 13px 'Courier New', monospace";
+      const tw = ctx.measureText(text).width;
+      ctx.fillStyle = color;
+      ctx.fillRect(x1, y1 - 22, tw + 12, 22);
+
+      // Label text
+      ctx.fillStyle = "#000";
+      ctx.fillText(text, x1 + 6, y1 - 6);
     });
 
-    if (!handsRef.current || isProcessingRef.current) return;
+    // ── FPS (real loop time) ──
     const now = performance.now();
-    if (now - lastProcessTimeRef.current < PROCESS_INTERVAL) return;
-    lastProcessTimeRef.current = now;
-    isProcessingRef.current = true;
-    handsRef.current
-      .send({ image: video })
-      .catch(console.error)
-      .finally(() => { isProcessingRef.current = false; });
-  }
+    setFps(Math.round(1000 / (now - lastFrameTimeRef.current)));
+    lastFrameTimeRef.current = now;
 
-  // ── Start camera ───────────────────────────────────────────────
-  async function startCamera() {
-    if (!scriptLoaded || !window.Hands || !videoRef.current) return;
-    try {
-      setStatus("loading");
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-      videoRef.current.srcObject = stream;
-      await new Promise<void>((res) => { videoRef.current!.onloadedmetadata = () => res(); });
-      await videoRef.current.play();
+    setDetections(finalBoxes.map((b) => ({
+      label: COCO_CLASSES[b.classId] ?? "unknown",
+      score: b.score,
+    })));
 
-      handsRef.current = new window.Hands({
-        locateFile: (f: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`,
-      });
-      handsRef.current.setOptions({
-        maxNumHands: 2,
-        modelComplexity: 1,
-        minDetectionConfidence: 0.7,
-        minTrackingConfidence: 0.5,
-      });
+    animationRef.current = requestAnimationFrame(loop);
+  }, []);
 
-      handsRef.current.onResults((results: any) => {
-        if (results.multiHandLandmarks?.length) {
-          // เก็บข้อมูลทุกมือ
-          handsDataRef.current = results.multiHandLandmarks.map((lm: any, i: number) => ({
-            lm,
-            isRight: results.multiHandedness?.[i]?.label === "Right",
-          }));
-
-          // คำนวณ state สำหรับ UI
-          const info = handsDataRef.current.map(({ lm, isRight }) => {
-            const up = countFingers(lm, isRight);
-            return { isRight, up, count: up.filter(Boolean).length };
-          });
-          setHandsInfo(info);
-          setTotalCount(info.reduce((sum, h) => sum + h.count, 0));
-        } else {
-          handsDataRef.current = [];
-          setHandsInfo([]);
-          setTotalCount(0);
-        }
-      });
-
-      animationLoop();
-      setStatus("running");
-    } catch (e: any) {
-      console.error(e);
-      setStatus("idle");
-    }
-  }
-
-  // ── Stop camera ────────────────────────────────────────────────
-  function stopCamera() {
-    if (animationRef.current) { cancelAnimationFrame(animationRef.current); animationRef.current = null; }
-    if (videoRef.current?.srcObject) {
-      (videoRef.current.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
-      videoRef.current.srcObject = null;
-    }
-    handsRef.current = null;
-    handsDataRef.current = [];
-    setHandsInfo([]);
-    setTotalCount(0);
-    setStatus("stopped");
-  }
+  useEffect(() => {
+    loadModel();
+  }, []);
 
   const isRunning = status === "running";
 
   return (
-    <main style={{ fontFamily: "'Courier New', monospace" }} className="min-h-screen bg-black text-white p-6">
-      <div className="max-w-3xl mx-auto space-y-5">
+    <main
+      style={{ fontFamily: "'Courier New', monospace" }}
+      className="min-h-screen bg-black text-white p-6"
+    >
+      <div className="max-w-5xl mx-auto space-y-5">
 
         {/* Header */}
         <div className="flex items-center justify-between border-b border-gray-700 pb-3">
           <div>
             <h1 className="text-xl font-bold tracking-widest uppercase text-green-400">
-              Finger Counter · 2 Hands
+              YOLOv8 · Live Detection
             </h1>
-            <p className="text-xs text-gray-500 mt-0.5">นับนิ้วสองมือ real-time · MediaPipe</p>
+            <p className="text-xs text-gray-500 mt-0.5">COCO 80-class · ONNX Runtime WebAssembly</p>
           </div>
-          <div className="flex gap-2 items-center text-xs">
-            <span className={`w-2 h-2 rounded-full ${
-              isRunning ? "bg-green-400 animate-pulse" :
-              status === "loading" ? "bg-yellow-400 animate-pulse" : "bg-gray-600"
-            }`} />
-            <span className="uppercase tracking-widest text-gray-400">{status}</span>
+          <div className="flex gap-2 items-center text-xs text-gray-400">
+            <span
+              className={`w-2 h-2 rounded-full inline-block ${
+                status === "running" ? "bg-green-400 animate-pulse" :
+                status === "ready"   ? "bg-yellow-400" :
+                status === "loading" ? "bg-blue-400 animate-pulse" : "bg-gray-600"
+              }`}
+            />
+            <span className="uppercase tracking-widest">{status}</span>
           </div>
         </div>
 
-        {/* Buttons */}
-        <div className="flex gap-3">
-          <button onClick={startCamera} disabled={isRunning || !scriptLoaded}
-            className="px-5 py-2 bg-green-400 text-black font-bold text-sm tracking-widest uppercase rounded disabled:opacity-40 hover:bg-green-300 transition-colors">
+        {/* Controls */}
+        <div className="flex flex-wrap gap-3 items-center">
+          <button
+            onClick={startCamera}
+            disabled={isRunning || status === "loading"}
+            className="px-5 py-2 bg-green-400 text-black font-bold text-sm tracking-widest uppercase rounded disabled:opacity-40 hover:bg-green-300 transition-colors"
+          >
             ▶ Start
           </button>
-          <button onClick={stopCamera} disabled={!isRunning}
-            className="px-5 py-2 bg-red-500 text-white font-bold text-sm tracking-widest uppercase rounded disabled:opacity-40 hover:bg-red-400 transition-colors">
+          <button
+            onClick={stopCamera}
+            disabled={!isRunning}
+            className="px-5 py-2 bg-red-500 text-white font-bold text-sm tracking-widest uppercase rounded disabled:opacity-40 hover:bg-red-400 transition-colors"
+          >
             ■ Stop
           </button>
-          {!scriptLoaded && <span className="text-xs text-yellow-400 self-center animate-pulse">โหลด MediaPipe…</span>}
+
+          <div className="flex items-center gap-2 ml-4">
+            <label className="text-xs text-gray-400 uppercase tracking-widest whitespace-nowrap">
+              Confidence: <span className="text-green-400">{(confidenceThreshold * 100).toFixed(0)}%</span>
+            </label>
+            <input
+              type="range" min={10} max={95} step={5}
+              value={confidenceThreshold * 100}
+              onChange={(e) => setConfidenceThreshold(Number(e.target.value) / 100)}
+              className="w-28 accent-green-400"
+            />
+          </div>
+
+          <div className="flex items-center gap-2">
+            <label className="text-xs text-gray-400 uppercase tracking-widest whitespace-nowrap">
+              Max: <span className="text-green-400">{maxDetections}</span>
+            </label>
+            <input
+              type="range" min={1} max={30} step={1}
+              value={maxDetections}
+              onChange={(e) => setMaxDetections(Number(e.target.value))}
+              className="w-20 accent-green-400"
+            />
+          </div>
         </div>
 
-        {/* Total count */}
-        <div className="border border-gray-800 rounded-lg px-6 py-4 bg-gray-950 flex items-center gap-6">
-          <div className="text-center">
-            <p className="text-xs text-gray-500 uppercase tracking-widest mb-1">รวม</p>
-            <span className="text-8xl font-bold text-green-400">{totalCount}</span>
-          </div>
-
-          {/* แสดงแต่ละมือ */}
-          <div className="flex gap-4 flex-1">
-            {[
-              { label: "RIGHT", color: HAND_COLORS.right },
-              { label: "LEFT",  color: HAND_COLORS.left  },
-            ].map(({ label, color }) => {
-              const hand = handsInfo.find((h) => (label === "RIGHT") === h.isRight);
-              return (
-                <div key={label} className="flex-1 border border-gray-800 rounded-lg p-3 bg-black">
-                  <p className="text-xs font-bold mb-2" style={{ color }}>{label}</p>
-                  <p className="text-4xl font-bold mb-2" style={{ color }}>
-                    {hand ? hand.count : "—"}
-                  </p>
-                  <div className="space-y-1">
-                    {FINGER_NAMES.map((name, i) => (
-                      <div key={i} className="flex items-center gap-1.5">
-                        <span
-                          className="w-2 h-2 rounded-full transition-all duration-100"
-                          style={{ backgroundColor: hand?.up[i] ? FINGER_COLORS[i] : "#333" }}
-                        />
-                        <span className={`text-xs transition-colors duration-100 ${hand?.up[i] ? "text-white" : "text-gray-600"}`}>
-                          {name}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+        {/* Stats bar */}
+        <div className="flex gap-6 text-sm border border-gray-800 rounded px-4 py-2 bg-gray-950">
+          <span>FPS: <span className="text-green-400 font-bold">{fps}</span></span>
+          <span>Objects: <span className="text-green-400 font-bold">{detections.length}</span></span>
+          <span className="text-gray-600">|</span>
+          <span className="text-gray-400 text-xs flex flex-wrap gap-2">
+            {detections.map((d, i) => (
+              <span key={i} style={{ color: getColor(i) }}>
+                {d.label} {(d.score * 100).toFixed(0)}%
+              </span>
+            ))}
+          </span>
         </div>
 
         {/* Canvas */}
         <div className="relative border border-gray-800 rounded-lg overflow-hidden bg-gray-950">
           {!isRunning && (
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
+            <div className="absolute inset-0 flex items-center justify-center z-10 pointer-events-none">
               <span className="text-gray-600 text-sm uppercase tracking-widest">
-                {status === "loading" ? "กำลังเริ่ม…" : "กล้องปิด"}
+                {status === "loading" ? "Loading model…" : "Camera off"}
               </span>
             </div>
           )}
-          <canvas ref={canvasRef} width={640} height={480} className="w-full block" />
+          <canvas ref={canvasRef} className="w-full block" />
         </div>
 
         <video ref={videoRef} className="hidden" playsInline muted />
 
         <p className="text-xs text-gray-700 text-center">
-          🟢 มือขวา &nbsp;|&nbsp; 🟣 มือซ้าย
+          Model: yolov8n.onnx · Place file at <code className="text-gray-500">public/models/yolov8n.onnx</code>
         </p>
       </div>
     </main>
