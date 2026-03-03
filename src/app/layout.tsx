@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Finger Counter",
-  description: "Finger Counter",
+  title: "YOLOv8 Object Detection AI",
+  description: "Real-time object detection using YOLOv8 and ONNX Runtime in browser.",
 };
 
 export default function RootLayout({
